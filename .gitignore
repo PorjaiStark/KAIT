@@ -11,3 +11,10 @@ env/
 # OS / IDE
 .DS_Store
 .vscode/settings.json
+
+# Training artifacts (reproducible, not source -- checkpoints/predictions can
+# exceed GitHub's 100MB per-file push limit)
+outputs/
+src/outputs/
+wandb/
+src/wandb/

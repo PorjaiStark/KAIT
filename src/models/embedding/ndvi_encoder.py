@@ -4,26 +4,33 @@ import torch.nn as nn
 
 class NDVIEncoder(nn.Module):
 
-    def __init__(self, out_dim=16):
+    def __init__(self, out_dim=64):
         super().__init__()
 
-        self.encoder = nn.Linear(1,out_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(1,32),
+            nn.GELU(),
+            nn.Linear(32,out_dim),
+            nn.LayerNorm(out_dim)
+        )
 
 
-    def forward(self, x):
+    def forward(self,x):
         """
-        Input:
-            x: [B,T,1]
+        x:
+        [B,T,1]
 
-        Output:
-            [B,T,16]
+        return:
+        [B,T,64]
         """
 
         return self.encoder(x)
 
 
+
 if __name__ == "__main__":
 
     encoder = NDVIEncoder()
+
 
     

@@ -3,10 +3,15 @@ import torch.nn as nn
 
 class LocationEncoder(nn.Module):
 
-    def __init__( self, out_dim = 32 ):
+    def __init__(self, in_dim=3, out_dim=64):
         super().__init__()
 
-        self.encoder = nn.Linear( 3, out_dim)
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, out_dim)
+        )
+
 
     def forward(self, x):
         """
@@ -17,11 +22,10 @@ class LocationEncoder(nn.Module):
             x,y,z coordinate
 
         Output:
-            [B,T,32]
+            [B,T,64]
         """
 
-        x = self.encoder(x)
-        return x
+        return self.encoder(x)
 
 
 
@@ -29,13 +33,3 @@ if __name__ == "__main__":
 
     encoder = LocationEncoder()
 
-    x = torch.randn(
-        4,
-        19,
-        3
-    )
-
-    out = encoder(x)
-
-    print("input:", x.shape)
-    print("output:", out.shape)

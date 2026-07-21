@@ -128,7 +128,6 @@ def build_and_save_splits(
     n_unseen_total: int = 100,
     seed: int = 42,
 ):
-    os.makedirs(output_dir, exist_ok=True)
 
     df = pd.read_csv(csv_path)
     df['date'] = pd.to_datetime(df['date'])
