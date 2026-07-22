@@ -1,5 +1,8 @@
 import os
 import sys
+import json
+import shutil
+from datetime import datetime
 
 import torch
 import torch.optim as optim
@@ -26,6 +29,7 @@ from src.models.embedding.location_encoder import LocationEncoder
 from src.models.embedding.weather_encoder import WeatherEncoder
 from src.models.embedding.sentinel_encoder import SentinelEncoder
 from src.losses.loss import BaselineDynamicsMAELoss
+from src.utils.run_logging import Tee, append_run_log
 
 # Config
 EPOCHS = 20  # full-data run: no LR scheduler, so best.pt (checkpointed on best
@@ -39,6 +43,26 @@ NUM_WORKERS = 8  # sentinel tifs are now re-tiled band-interleaved (see sentinel
                  # runs at this worker count. Watch `free -h` if you push this higher.
 USE_AMP = True
 USE_COMPILE = True
+
+LAMBDA_DYNAMICS = 6.0  # was 3.0 -- within-sample corr was low (0.18-0.52
+                       # across runs so far); raising this pushes the loss
+                       # to weight temporal shape over per-sample baseline
+                       # level more heavily. See loss.py's own docstring:
+                       # "raise it (5.0, 8.0...) if within-sample
+                       # correlation is still low after training"
+LAMBDA_BASELINE = 1.0
+D_MODEL = 256
+
+# Every training run gets its own folder under CHECKPOINTS_DIR/runs/<run_id>/
+# (checkpoint + config + per-epoch log + console output), so changing a
+# hyperparameter and running again doesn't overwrite the previous
+# experiment. CHECKPOINTS_DIR/best.pt is also updated each run as a
+# "latest" convenience copy for inference.py/evaluation.py, which read a
+# fixed path -- point them at a specific past run's checkpoint instead if
+# you need to inspect an older experiment.
+CHECKPOINTS_DIR = "outputs/checkpoints"
+RUNS_DIR = os.path.join(CHECKPOINTS_DIR, "runs")
+RUNS_LOG = os.path.join(CHECKPOINTS_DIR, "runs_log.csv")
 
 
 DEVICE = (
@@ -306,20 +330,38 @@ def evaluate(
 # Main
 def main():
 
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    real_stdout = sys.stdout
+    console_log = open(os.path.join(run_dir, "console_log.txt"), "w")
+    sys.stdout = Tee(real_stdout, console_log)
+
+    print(f"Run ID: {run_id}")
+
+    config = {
+        "epochs": EPOCHS,
+        "lr": LR,
+        "batch_size": BATCH_SIZE,
+        "loss": "BaselineDynamicsMAELoss",
+        "lambda_dynamics": LAMBDA_DYNAMICS,
+        "lambda_baseline": LAMBDA_BASELINE,
+        "d_model": D_MODEL,
+        "device": DEVICE,
+        "amp": USE_AMP,
+        "compile": USE_COMPILE,
+    }
+
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+    epoch_log_path = os.path.join(run_dir, "epoch_log.csv")
 
     wandb.init(
         project="ndvi-transformer",
-        config={
-            "epochs": EPOCHS,
-            "lr": LR,
-            "batch_size": BATCH_SIZE,
-            "loss": "BaselineDynamicsMAELoss",
-            "lambda_dynamics": 3.0,
-            "lambda_baseline": 1.0,
-            "device": DEVICE,
-            "amp": USE_AMP,
-            "compile": USE_COMPILE
-        }
+        name=run_id,
+        config=config
     )
 
     # Dataset
@@ -363,7 +405,7 @@ def main():
 
     # Model + Encoder
     model = NDVITransformerModel(
-        d_model=256
+        d_model=D_MODEL
     )
 
 
@@ -403,7 +445,10 @@ def main():
 
 
 
-    criterion = BaselineDynamicsMAELoss()
+    criterion = BaselineDynamicsMAELoss(
+        lambda_dynamics=LAMBDA_DYNAMICS,
+        lambda_baseline=LAMBDA_BASELINE
+    )
 
 
 
@@ -426,6 +471,7 @@ def main():
 
 
     best_loss = float("inf")
+    best_epoch = None
 
 
 
@@ -473,17 +519,19 @@ Valid total: {valid_loss:.5f} (baseline={valid_baseline_loss:.5f}, dynamics={val
 
 
 
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "train_baseline_loss": train_baseline_loss,
-                "train_dynamics_loss": train_dynamics_loss,
-                "valid_loss": valid_loss,
-                "valid_baseline_loss": valid_baseline_loss,
-                "valid_dynamics_loss": valid_dynamics_loss
-            }
-        )
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_baseline_loss": train_baseline_loss,
+            "train_dynamics_loss": train_dynamics_loss,
+            "valid_loss": valid_loss,
+            "valid_baseline_loss": valid_baseline_loss,
+            "valid_dynamics_loss": valid_dynamics_loss
+        }
+
+        wandb.log(epoch_metrics)
+
+        append_run_log(epoch_metrics, epoch_log_path)
 
 
 
@@ -491,13 +539,10 @@ Valid total: {valid_loss:.5f} (baseline={valid_baseline_loss:.5f}, dynamics={val
 
 
             best_loss = valid_loss
+            best_epoch = epoch
 
 
-            os.makedirs(
-                "outputs/checkpoints",
-                exist_ok=True
-            )
-
+            run_checkpoint_path = os.path.join(run_dir, "best.pt")
 
             torch.save(
                 {
@@ -523,10 +568,23 @@ Valid total: {valid_loss:.5f} (baseline={valid_baseline_loss:.5f}, dynamics={val
                         epoch,
 
                     "valid_loss":
-                        valid_loss
+                        valid_loss,
+
+                    "run_id":
+                        run_id,
+
+                    "config":
+                        config
                 },
 
-                "outputs/checkpoints/best.pt"
+                run_checkpoint_path
+            )
+
+            # "latest" convenience copy at the fixed path inference.py/
+            # evaluation.py read by default.
+            shutil.copyfile(
+                run_checkpoint_path,
+                os.path.join(CHECKPOINTS_DIR, "best.pt")
             )
 
 
@@ -537,6 +595,34 @@ Valid total: {valid_loss:.5f} (baseline={valid_baseline_loss:.5f}, dynamics={val
 
 
     wandb.finish()
+
+    summary = {
+        "run_id": run_id,
+        "config": config,
+        "best_epoch": best_epoch,
+        "best_valid_loss": best_loss,
+        "checkpoint_path": os.path.join(run_dir, "best.pt"),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    with open(os.path.join(run_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    log_row = {
+        "run_id": run_id,
+        "timestamp": summary["timestamp"],
+        "best_epoch": best_epoch,
+        "best_valid_loss": best_loss,
+        **config,
+    }
+    append_run_log(log_row, RUNS_LOG)
+
+    print(f"\nRun complete. Best valid_loss={best_loss:.5f} at epoch {best_epoch}")
+    print(f"Saved run to: {run_dir}")
+    print(f"Appended run summary to: {RUNS_LOG}")
+
+    sys.stdout = real_stdout
+    console_log.close()
 
 
 

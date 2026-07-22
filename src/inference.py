@@ -1,7 +1,9 @@
 import os
 import sys
+import shutil
 
 import torch
+import pandas as pd
 from torch.utils.data import DataLoader
 
 
@@ -44,6 +46,18 @@ USE_COMPILE = True
 CHECKPOINT = "outputs/checkpoints/best.pt"
 BATCH_SIZE = 64        # no gradients held during inference; raise further if VRAM allows
 NUM_WORKERS = 8
+
+NDVI_TIMESERIES_CSV = "/home/takanolab/デスクトップ/KAIT/data/processed/data_before_split/ndvi_timeseries.csv"
+WEATHER_ROOT = "/home/takanolab/デスクトップ/kait_observe/weather"
+SENTINEL_ROOT = "/home/takanolab/デスクトップ/kait_observe/preprocessing_ex_retiled"
+
+# (split name, split csv) pairs to run inference on -- each produces its own
+# outputs/predictions/<name>_prediction.pt, so evaluation.py can be pointed
+# at either independently.
+TEST_SPLITS = [
+    ("test1", "/home/takanolab/デスクトップ/KAIT/data/processed/split/test1.csv"),
+    ("test2", "/home/takanolab/デスクトップ/KAIT/data/processed/split/test2.csv"),
+]
 
 
 # Encode
@@ -94,7 +108,8 @@ def encode_batch(
 def inference(
     model,
     loader,
-    encoders
+    encoders,
+    time_norm_days
 ):
 
     model.eval()
@@ -115,6 +130,19 @@ def inference(
     sequence_masks = []
     future_query_masks = []
 
+    # real calendar dates for each future/target timestep, so plots can use
+    # a true date axis instead of a plain 0..T index -- see
+    # datasets/dataloader.py encode_time(): time_sequence[..., 0] is
+    # gap_norm = (date - anchor_date).days / time_norm_days, so the real
+    # date is recoverable as anchor_date + gap_norm * time_norm_days days.
+    future_dates_list = []
+
+    # observe (input history) window, so sample plots can show it leading
+    # up to the future/prediction window instead of starting cold at the
+    # anchor date -- same date-recovery trick, gap_days is <= 0 here.
+    observe_ndvi_list = []
+    observe_dates_list = []
+
 
     for step, batch in enumerate(loader):
 
@@ -123,6 +151,10 @@ def inference(
             flush=True
         )
 
+
+        # non-tensor fields (plain python lists) -- must be grabbed before
+        # the tensor-only filter below, which would otherwise silently drop them
+        anchor_dates_batch = batch["anchor_date"]
 
         batch = {
             k:v.to(DEVICE)
@@ -215,6 +247,34 @@ def inference(
                 batch["future_query_mask"][i].cpu()
             )
 
+            gap_norm = batch["time_sequence"][i, :, 0][
+                batch["future_query_mask"][i]
+            ].float().cpu().numpy()
+
+            anchor_date = pd.Timestamp(anchor_dates_batch[i])
+
+            future_dates_list.append([
+                (anchor_date + pd.Timedelta(days=float(g) * time_norm_days)).strftime("%Y-%m-%d")
+                for g in gap_norm
+            ])
+
+            observe_positions = (
+                batch["sequence_mask"][i] & (~batch["future_query_mask"][i])
+            )
+
+            observe_ndvi_list.append(
+                batch["ndvi_sequence"][i, :, 0][observe_positions].float().cpu()
+            )
+
+            observe_gap_norm = batch["time_sequence"][i, :, 0][
+                observe_positions
+            ].float().cpu().numpy()
+
+            observe_dates_list.append([
+                (anchor_date + pd.Timedelta(days=float(g) * time_norm_days)).strftime("%Y-%m-%d")
+                for g in observe_gap_norm
+            ])
+
 
     return (
         predictions,
@@ -225,45 +285,13 @@ def inference(
         future_embedding_list,
         sequence_masks,
         future_query_masks,
+        future_dates_list,
+        observe_ndvi_list,
+        observe_dates_list,
     )
 
 # Main
 def main():
-
-
-    # Dataset
-    test_dataset = MultiModalNDVIDataset(
-
-        split_csv=
-        "/home/takanolab/デスクトップ/KAIT/data/processed/split/test1.csv",
-
-        ndvi_timeseries_csv=
-        "/home/takanolab/デスクトップ/KAIT/data/processed/data_before_split/ndvi_timeseries.csv",
-
-        weather_root=
-        "/home/takanolab/デスクトップ/kait_observe/weather",
-
-        sentinel_root=
-        "/home/takanolab/デスクトップ/kait_observe/preprocessing_ex_retiled"
-
-    )
-    
-    loader = DataLoader(
-
-        test_dataset,
-
-        batch_size=BATCH_SIZE,
-
-        shuffle=False,
-
-        collate_fn=multimodal_collate_fn,
-
-        num_workers=NUM_WORKERS,
-
-        pin_memory=DEVICE == "cuda"
-
-    )
-
 
     # Build model
     model = NDVITransformerModel(
@@ -306,6 +334,12 @@ def main():
         CHECKPOINT,
         map_location=DEVICE
     )
+
+    # which training run produced this checkpoint (embedded by train.py
+    # since the run-tracking system was added -- see outputs/checkpoints/
+    # runs/<run_id>/). Used below to tag saved predictions so they stay
+    # tied to this exact checkpoint even if you never retrain.
+    checkpoint_run_id = checkpoint.get("run_id")
 
     def strip_compile_prefix(state_dict):
         # train.py saves state_dict() from a torch.compile-wrapped module for
@@ -368,46 +402,56 @@ def main():
 
 
 
-    # ======================
-    # Run
-    # ======================
-
-
-    (
-        predictions,
-        targets,
-        masks,
-        pre_transformer_list,
-        transformer_output_list,
-        future_embedding_list,
-        sequence_masks,
-        future_query_masks,
-    ) = inference(
-
-        model,
-
-        loader,
-
-        encoders
-
-    )
-
-
-
-    # ======================
-    # Save
-    # ======================
-
-
     os.makedirs(
         "outputs/predictions",
         exist_ok=True
     )
 
 
-    torch.save(
+    # ======================
+    # Run + save, once per split
+    # ======================
 
-        {
+    for split_name, split_csv in TEST_SPLITS:
+
+        print(f"\n==== Running inference on split: {split_name} ====")
+
+        test_dataset = MultiModalNDVIDataset(
+            split_csv=split_csv,
+            ndvi_timeseries_csv=NDVI_TIMESERIES_CSV,
+            weather_root=WEATHER_ROOT,
+            sentinel_root=SENTINEL_ROOT
+        )
+
+        loader = DataLoader(
+            test_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            collate_fn=multimodal_collate_fn,
+            num_workers=NUM_WORKERS,
+            pin_memory=DEVICE == "cuda"
+        )
+
+        (
+            predictions,
+            targets,
+            masks,
+            pre_transformer_list,
+            transformer_output_list,
+            future_embedding_list,
+            sequence_masks,
+            future_query_masks,
+            future_dates_list,
+            observe_ndvi_list,
+            observe_dates_list,
+        ) = inference(
+            model,
+            loader,
+            encoders,
+            test_dataset.time_norm_days
+        )
+
+        result = {
             "prediction": predictions,
 
             "target": targets,
@@ -427,27 +471,50 @@ def main():
 
             "sequence_mask": sequence_masks,
 
-            "future_query_mask": future_query_masks
+            "future_query_mask": future_query_masks,
 
-        },
+            # real calendar dates (list[str] per sample, "YYYY-MM-DD"), same
+            # order/length as target/mask/prediction for that sample -- lets
+            # evaluation.py plot on a true date axis instead of a plain index
+            "future_dates": future_dates_list,
 
-        "outputs/predictions/test1_prediction.pt"
+            # observe (input history) window -- same idea, lets sample
+            # plots show the lead-up to the future/prediction window
+            "observe_ndvi": observe_ndvi_list,
 
-    )
+            "observe_dates": observe_dates_list,
 
+            # which training run's checkpoint produced this prediction file
+            # (None if CHECKPOINT predates run-tracking) -- lets
+            # evaluation.py trace results back to that run's config/summary
+            "checkpoint_run_id": checkpoint_run_id
+        }
 
-    print("\nSaved inference result")
+        latest_path = f"outputs/predictions/{split_name}_prediction.pt"
 
-    print(
-        "Number of samples:",
-        len(predictions)
-    )
+        torch.save(result, latest_path)
 
+        if checkpoint_run_id is not None:
 
-    print(
-        "Example prediction shape:",
-        predictions[0].shape
-    )
+            run_pred_dir = os.path.join("outputs/predictions/runs", checkpoint_run_id)
+            os.makedirs(run_pred_dir, exist_ok=True)
+
+            run_pred_path = os.path.join(run_pred_dir, f"{split_name}_prediction.pt")
+            shutil.copyfile(latest_path, run_pred_path)
+
+            print(f"Also archived to: {run_pred_path}")
+
+        print(f"\nSaved inference result for {split_name}")
+
+        print(
+            "Number of samples:",
+            len(predictions)
+        )
+
+        print(
+            "Example prediction shape:",
+            predictions[0].shape
+        )
 
 
 

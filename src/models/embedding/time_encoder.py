@@ -13,14 +13,22 @@ class TimeEncoder(nn.Module):
 
         assert self.year_dim > 0
 
-        self.gap_encoder = nn.Linear(
-            1,
-            self.gap_dim
+        # was a single bare Linear(1, dim) -- a rank-1 affine map of the
+        # scalar input, matching no other encoder in this codebase (NDVI/
+        # Location/Weather all use Linear->GELU->Linear). Future tokens'
+        # only real per-timestep signal is this gap/year encoding (ndvi/
+        # weather/sentinel are zero, location is constant per-sample), so
+        # this was a hard rank-1 ceiling on future token diversity.
+        self.gap_encoder = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.GELU(),
+            nn.Linear(32, self.gap_dim)
         )
 
-        self.year_encoder = nn.Linear(
-            1,
-            self.year_dim
+        self.year_encoder = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.GELU(),
+            nn.Linear(32, self.year_dim)
         )
 
 
